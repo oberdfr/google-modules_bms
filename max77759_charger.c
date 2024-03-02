@@ -335,8 +335,6 @@ static const struct bcl_ifpmic_ops bcl_ifpmic_ops = {
 	max77759_get_uvlo_lvl,
 	max77759_set_batoilo_lvl,
 	max77759_get_batoilo_lvl,
-	max77759_get_bcl_irq,
-	max77759_clr_bcl_irq,
 };
 #endif /* CONFIG_GOOGLE_BCL */
 
