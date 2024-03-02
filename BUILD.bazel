@@ -1,6 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-or-later
-
-load("//build/kernel/kleaf:kernel.bzl", "kernel_module")
+load("//build/kleaf:kernel.bzl", "kernel_module")
 
 filegroup(
     name = "headers",
@@ -13,15 +11,7 @@ filegroup(
 )
 
 kernel_module(
-    name = "bms",
-    srcs = glob([
-        "**/*.c",
-        "**/*.h",
-        "Kbuild",
-    ]) + [
-        "//private/google-modules/bms/misc:headers",
-        "//private/google-modules/soc/gs:gs_soc_headers",
-    ],
+    name = "bms.cloudripper",
     outs = [
         "google-battery.ko",
         "google-bms.ko",
@@ -34,29 +24,14 @@ kernel_module(
         "max77729-pmic.ko",
         "max77729_charger.ko",
         "max77729_uic.ko",
-        "max77759-charger.ko",
-        "max77779-charger.ko",
+        "max77759_charger.ko",
+        "overheat_mitigation.ko",
         "p9221.ko",
         "pca9468.ko",
-        "max77779_i2cm.ko",
-        "max77779_pmic.ko",
-        "max77779_pmic_irq.ko",
-        "max77779_pmic_pinctrl.ko",
-        "max77779_pmic_sgpio.ko",
-        "max77779-sp.ko",
-        "ln8411.ko",
-        # "max77729.ko",
-        # "max77759.ko",
-        # "pca9468-google.ko",
     ],
-    kernel_build = "//private/google-modules/soc/gs:gs_kernel_build",
+    kernel_build = "//private/gs-google:cloudripper",
     visibility = [
-        "//private/devices/google:__subpackages__",
         "//private/google-modules/power/reset:__subpackages__",
-        "//private/google-modules/soc/gs:__pkg__",
-    ],
-    deps = [
-        "//private/google-modules/bms/misc:bms-misc",
-        "//private/google-modules/soc/gs:gs_soc_module",
+        "//private/gs-google:__pkg__",
     ],
 )
