@@ -3069,7 +3069,7 @@ static int batt_calc_charging_speed(struct batt_drv *batt_drv)
 		return batt_drv->fake_charging_speed;
 
 	/* if the battery is the limit, speed is 100% */
-	if (chg_type == POWER_SUPPLY_CHARGE_TYPE_TAPER_EXT)
+	if (chg_type == POWER_SUPPLY_CHARGE_TYPE_TAPER)
 		return 100;
 
 	/* Get average current via tiers. */
@@ -3378,7 +3378,7 @@ static int msc_logic_irdrop(struct batt_drv *batt_drv,
 
 		batt_prlog(BATT_PRLOG_ALWAYS, "MSC_PRE vt=%d vb=%d fv_uv=%d chg_type=%d\n",
 			   vtier, vbatt, *fv_uv, chg_type);
-	} else if (chg_type != POWER_SUPPLY_CHARGE_TYPE_TAPER_EXT) {
+	} else if (chg_type != POWER_SUPPLY_CHARGE_TYPE_TAPER) {
 		const int type_margin = utv_margin;
 
 		/*
@@ -4758,7 +4758,7 @@ static int msc_logic(struct batt_drv *batt_drv)
 
 		if (chg_type == POWER_SUPPLY_CHARGE_TYPE_FAST) {
 			msc_state = MSC_FAST;
-		} else if (chg_type != POWER_SUPPLY_CHARGE_TYPE_TAPER_EXT) {
+		} else if (chg_type != POWER_SUPPLY_CHARGE_TYPE_TAPER) {
 			msc_state = MSC_TYPE;
 		} else {
 			msc_state = MSC_LAST;
@@ -4833,7 +4833,7 @@ static int msc_logic(struct batt_drv *batt_drv)
 			batt_drv->checked_tier_switch_cnt = 0;
 			msc_state = MSC_RSTC;
 		} else if ((cc_next_max == 0) &&
-				   (chg_type == POWER_SUPPLY_CHARGE_TYPE_TAPER_EXT) &&
+				   (chg_type == POWER_SUPPLY_CHARGE_TYPE_TAPER) &&
 				   (temp >= batt_drv->cv_max_temp)) {
 
 			vbatt_idx = batt_drv->vbatt_idx + 1;
