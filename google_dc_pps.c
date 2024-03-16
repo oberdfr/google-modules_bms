@@ -32,6 +32,8 @@
 
 #define PPS_UPDATE_DELAY_MS		2000
 
+#define get_boot_sec() div_u64(ktime_to_ns(ktime_get_boottime()), NSEC_PER_SEC)
+
 void pps_log(struct pd_pps_data *pps, const char *fmt, ...)
 {
 	va_list args;
@@ -124,7 +126,6 @@ struct tcpm_port *chg_get_tcpm_port(struct power_supply *tcpm_psy)
 
 	return (struct tcpm_port *)port;
 }
-
 
 /* false when not present or error (either way don't run) */
 static enum pd_pps_stage pps_is_avail(struct pd_pps_data *pps,

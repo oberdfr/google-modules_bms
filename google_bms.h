@@ -20,6 +20,7 @@
 #include <linux/minmax.h>
 #include <linux/types.h>
 #include <linux/usb/pd.h>
+#include <misc/gvotable.h>
 #include <misc/logbuffer.h>
 #include "gbms_power_supply.h"
 #include "qmath.h"
@@ -27,7 +28,6 @@
 
 struct device_node;
 
-#define get_boot_sec() div_u64(ktime_to_ns(ktime_get_boottime()), NSEC_PER_SEC)
 #define GBMS_CHG_TEMP_NB_LIMITS_MAX 10
 #define GBMS_CHG_VOLT_NB_LIMITS_MAX 5
 #define GBMS_CHG_ALG_BUF_SZ 500
@@ -141,6 +141,7 @@ enum gbms_msc_states_t {
 	MSC_RSTC,	/* in taper */
 	MSC_NEXT,	/* in taper */
 	MSC_NYET,	/* in taper */
+	MSC_DONE,
 	MSC_HEALTH,
 	MSC_HEALTH_PAUSE,
 	MSC_HEALTH_ALWAYS_ON,
@@ -310,10 +311,6 @@ enum gbms_stats_tier_idx_t {
 	GBMS_STATS_TH_LVL8 = 58,
 	GBMS_STATS_TH_LVL9 = 59,
 
-	/* Dual batteries */
-	GBMS_STATS_BASE_BATT = 90,
-	GBMS_STATS_SEC_BATT = 91,
-
 	/* TODO: rename, these are not really related to AC */
 	GBMS_STATS_AC_TI_FULL_CHARGE = 100,
 	GBMS_STATS_AC_TI_HIGH_SOC = 101,
@@ -424,6 +421,7 @@ union gbms_charger_state {
 	} f;
 };
 
+struct device_node *gbms_batt_id_node(struct device_node *node);
 int gbms_init_chg_profile_internal(struct gbms_chg_profile *profile,
 			  struct device_node *node, const char *owner_name);
 #define gbms_init_chg_profile(p, n) \
@@ -441,7 +439,9 @@ void gbms_dump_raw_profile(char *buff, size_t len, const struct gbms_chg_profile
 int gbms_msc_temp_idx(const struct gbms_chg_profile *profile, int temp);
 int gbms_msc_voltage_idx(const struct gbms_chg_profile *profile, int vbatt);
 int gbms_msc_round_fv_uv(const struct gbms_chg_profile *profile,
-			   int vtier, int fv_uv, int cc_ua);
+			   int vtier, int fv_uv, int cc_ua, bool allow_higher_fv);
+int gbms_msc_voltage_idx_merge_tiers(const struct gbms_chg_profile *profile,
+				     int vbatt, int temp_idx);
 
 /* newgen charging: charger flags  */
 uint8_t gbms_gen_chg_flags(int chg_status, int chg_type);
@@ -455,6 +455,10 @@ int gbms_aacr_fade10(const struct gbms_chg_profile *profile, int cycles);
 __printf(5,6)
 void gbms_logbuffer_prlog(struct logbuffer *log, int level, int debug_no_logbuffer,
 			  int debug_printk_prlog, const char *f, ...);
+#define GBMS_DEV_LOGBUFFER(log, dev, level, debug_no_logbuffer, debug_printk_prlog, fmt, ...) { \
+	gbms_logbuffer_prlog(log, level, debug_no_logbuffer, debug_printk_prlog, \
+	"%s %s: " fmt, dev_driver_string(dev), dev_name(dev), ##__VA_ARGS__); \
+}
 
 /* debug/print */
 const char *gbms_chg_type_s(int chg_type);
@@ -470,6 +474,7 @@ const char *gbms_chg_ev_adapter_s(int adapter);
 #define VOTABLE_FAN_LEVEL	"FAN_LEVEL"
 #define VOTABLE_DEAD_BATTERY	"DEAD_BATTERY"
 #define VOTABLE_TEMP_DRYRUN	"MSC_TEMP_DRYRUN"
+#define VOTABLE_MSC_LAST	"MSC_LAST"
 #define VOTABLE_MDIS		"CHG_MDIS"
 #define VOTABLE_THERMAL_LVL	"CHG_THERM_LVL"
 
@@ -479,9 +484,17 @@ const char *gbms_chg_ev_adapter_s(int adapter);
 #define VOTABLE_CHARGING_POLICY	"CHARGING_POLICY"
 #define VOTABLE_CHARGING_UISOC	"CHARGING_UISOC"
 
+#define VOTABLE_HDA_TZ		"HDA_TZ"
+
 #define VOTABLE_DC_CHG_AVAIL	"DC_AVAIL"
 #define REASON_DC_DRV		"DC_DRV"
 #define REASON_MDIS		"MDIS"
+
+#define HDA_TZ_WLC_NONE		(0)
+#define HDA_TZ_WLC_ADAPTER	(1)
+#define HDA_TZ_WLC_EPP_1P	(10)
+#define HDA_TZ_WLC_EPP_3P	(20)
+#define HDA_TZ_WLC_NOT_ALIGN	(30)
 
 #define FAN_LVL_UNKNOWN		-1
 #define FAN_LVL_NOT_CARE	0
@@ -637,12 +650,25 @@ enum bhi_status {
 	BH_NEEDS_REPLACEMENT,
 	BH_FAILED,
 	BH_NOT_AVAILABLE,
+	BH_INCONSISTENT,
 };
 
 struct bhi_weight {
 	int w_ci;
 	int w_ii;
 	int w_sd;
+};
+
+enum bhi_fg_recalibration_mode {
+	REC_MODE_RESET = 0,
+	REC_MODE_BEST_TIME,
+	REC_MODE_IMMEDIATE,
+	REC_MODE_RESTART,
+};
+
+enum bhi_fg_recalibration_state {
+	REC_STATE_OK = 0,
+	REC_STATE_SCHEDULED,
 };
 
 /* Charging Speed */
@@ -743,5 +769,12 @@ static const struct file_operations name ## _fops = {	\
 	.write	= name ## _store,			\
 }
 
+
+/* trend point types */
+#define GBMS_TP_TRENDPOINTS   'T'
+#define GBMS_TP_LOWER_BOUND   'L'
+#define GBMS_TP_UPPER_BOUND   'U'
+#define GBMS_TP_LOWER_TRIGGER 'F'
+#define GBMS_TP_UPPER_TRIGGER 'C'
 
 #endif  /* __GOOGLE_BMS_H_ */

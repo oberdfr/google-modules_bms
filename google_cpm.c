@@ -29,13 +29,15 @@
 #include <linux/platform_device.h>
 #include <linux/thermal.h>
 #include <linux/slab.h>
-#include <misc/gvotable.h>
 #include "gbms_power_supply.h"
 #include "google_bms.h"
 #include "google_dc_pps.h"
 #include "google_psy.h"
 
 #include <linux/debugfs.h>
+
+#define get_boot_sec() div_u64(ktime_to_ns(ktime_get_boottime()), NSEC_PER_SEC)
+
 
 /* Non DC Charger is the default */
 #define GCPM_DEFAULT_CHARGER	0
@@ -78,6 +80,9 @@
 /* TODO: move to configuration */
 #define DC_VBATT_HEADROOM_MV	500000
 
+static const int GCPM_FCC_RETRIES = 200;
+static const int GCPM_FCC_RETRY_INTERVAL = 1000;
+
 enum gcpm_dc_state_t {
 	DC_DISABLED = -1,
 	DC_IDLE = 0,
@@ -112,6 +117,8 @@ enum {
 #define MDIS_CDEV_NAME "chg_mdis"
 #define MDIS_IN_MAX	4
 #define MDIS_OUT_MAX	GCPM_MAX_CHARGERS
+
+#define MDIS_REASON_SETUP "SETUP"
 
 struct mdis_thermal_device
 {
@@ -189,7 +196,7 @@ struct gcpm_drv  {
 	struct power_supply *wlc_dc_psy;
 	struct pd_pps_data wlc_pps_data;
 	u32 wlc_phandle;
-
+	bool no_init_wlc_ta_vol;
 	struct delayed_work select_work;
 
 	/* set to force PPS negotiation */
@@ -250,11 +257,22 @@ struct gcpm_drv  {
 	bool resume_complete;
 	struct notifier_block chg_nb;
 
+	/* Charge Overcurrent Protection Enabled*/
+	bool cop_enabled;
+
 	/* tie up to charger mode */
 	struct gvotable_election *gbms_mode;
 
 	/* debug fs */
 	struct dentry *debug_entry;
+
+	int wlc_dc_fcc;
+
+	/* fcc retry */
+	int fcc_retries;
+	int fcc_retry_limit;
+	struct delayed_work fcc_retry_work;
+
 };
 
 #define gcpm_psy_name(psy) \
@@ -577,7 +595,7 @@ static int gcpm_dc_stop(struct gcpm_drv *gcpm, int index)
 				index, ret);
 		else
 			gcpm->dc_state = DC_ENABLE;
-		/* Fall Through */
+		fallthrough;
 	case DC_ENABLE:
 	case DC_ENABLE_PASSTHROUGH:
 		ret = gcpm_dc_enable(gcpm, false);
@@ -585,7 +603,7 @@ static int gcpm_dc_stop(struct gcpm_drv *gcpm, int index)
 			pr_err("DC_PPS: Cannot disable DC (%d)", ret);
 			break;
 		}
-		/* Fall Through */
+		fallthrough;
 	default:
 		gcpm->dc_state = DC_DISABLED;
 		break;
@@ -707,6 +725,12 @@ static int gcpm_dc_start(struct gcpm_drv *gcpm, int index)
 	ret = gcpm_update_gcpm_fcc(gcpm, "CC_MAX", gcpm->cc_max, true);
 	if (ret < 0)
 		pr_debug("PPS_DC: start cannot update cp_fcc (%d)\n", ret);
+
+	if (gcpm->pps_index == PPS_INDEX_WLC) {
+		gcpm_update_gcpm_fcc(gcpm, "WLC_FCC", gcpm->wlc_dc_fcc, gcpm->wlc_dc_fcc > 0);
+		pr_info("PPS_DC: index=%d vote gcpm_fcc to %d\n",
+			 gcpm->pps_index, gcpm->wlc_dc_fcc);
+	}
 
 	/* this is the CP */
 	dc_psy = gcpm_chg_get_active_cp(gcpm);
@@ -956,10 +980,14 @@ static int gcpm_chg_select_by_voltage(struct power_supply *psy,
 	}
 
 exit_done:
-
-	pr_debug("%s: index=%d->%d vbatt=%d: low=%d min=%d high=%d max=%d\n",
-		 __func__, gcpm->dc_index, index, vbatt, vbatt_low, vbatt_min,
-		vbatt_high, vbatt_max);
+	if (gcpm->dc_index == GCPM_INDEX_DC_ENABLE && index == GCPM_DEFAULT_CHARGER)
+		pr_info("%s: index=%d->%d vbatt=%d: low=%d min=%d high=%d max=%d\n",
+			__func__, gcpm->dc_index, index, vbatt, vbatt_low, vbatt_min,
+			vbatt_high, vbatt_max);
+	else
+		pr_debug("%s: index=%d->%d vbatt=%d: low=%d min=%d high=%d max=%d\n",
+			 __func__, gcpm->dc_index, index, vbatt, vbatt_low, vbatt_min,
+			 vbatt_high, vbatt_max);
 
 	return index;
 }
@@ -1064,14 +1092,14 @@ static struct pd_pps_data *gcpm_pps_data(struct gcpm_drv *gcpm)
 static int gcpm_pps_wait_for_ready(struct gcpm_drv *gcpm)
 {
 	struct pd_pps_data *pps_data = gcpm_pps_data(gcpm);
-	int pps_ui, vout = -1, iout = -1;
+	int pps_ui = 0, vout = -1, iout = -1;
 	bool pwr_ok = false;
 
 	if (!pps_data)
 		return -ENODEV;
 
 	/* determine the limit/levels if needed */
-	if (gcpm->pps_index == PPS_INDEX_WLC) {
+	if (gcpm->pps_index == PPS_INDEX_WLC && !gcpm->no_init_wlc_ta_vol) {
 		struct power_supply *chg_psy = gcpm_chg_get_active(gcpm);
 		int vbatt = -1;
 
@@ -1084,7 +1112,8 @@ static int gcpm_pps_wait_for_ready(struct gcpm_drv *gcpm)
 	}
 
 	/* always need to ping */
-	pps_ui = pps_update_adapter(pps_data, vout, iout, pps_data->pps_psy);
+	if (gcpm->pps_index != PPS_INDEX_WLC || !gcpm->no_init_wlc_ta_vol)
+		pps_ui = pps_update_adapter(pps_data, vout, iout, pps_data->pps_psy);
 	if (pps_ui < 0) {
 		pr_err("PPS_Work: pps update, dc_state=%d (%d)\n",
 			gcpm->dc_state, pps_ui);
@@ -1205,8 +1234,9 @@ static int gcpm_pps_offline(struct gcpm_drv *gcpm)
 			pr_err("PPS_DC: fail wlc offline (%d)\n", ret);
 	}
 
-	if (tdev)
-		gcpm_update_mdis_charge_cntl_limit(tdev, tdev->current_level);
+	/* force the callback set dc -> main thermal limits */
+	if (tdev && gcpm->mdis_votable)
+		gvotable_run_election(gcpm->mdis_votable, true);
 
 	gcpm->pps_index = 0;
 	return 0;
@@ -1345,8 +1375,12 @@ static int gcpm_chg_select_logic(struct gcpm_drv *gcpm)
 			gcpm->taper_step -= 1;
 		}
 
-		pr_debug("%s: taper_step=%d done=%d\n", __func__,
-			 gcpm->taper_step, dc_done);
+		if (dc_done)
+			pr_info("%s: taper_step=%d done=%d\n", __func__,
+				gcpm->taper_step, dc_done);
+		else
+			pr_debug("%s: taper_step=%d done=%d\n", __func__,
+				 gcpm->taper_step, dc_done);
 	} else if (gcpm->taper_step != 0) {
 		const int vbatt_high = gcpm->dc_limit_vbatt_high;
 
@@ -1490,6 +1524,9 @@ static int gcpm_pps_wlc_dc_restart_default(struct gcpm_drv *gcpm)
 	ret = gcpm_update_votes(gcpm, 0);
 	if (ret < 0)
 		pr_err("PPS_DC: wlc_dc_rd cannot update votes (%d)\n", ret);
+
+	pr_debug("PPS_DC: gcpm_update_gcpm_fcc unvote\n");
+	gcpm_update_gcpm_fcc(gcpm, "WLC_FCC", 0, false);
 
 	/* Clear taper count if not complete */
 	gcpm_taper_ctl(gcpm, 0);
@@ -1761,8 +1798,9 @@ static void gcpm_pps_wlc_dc_work(struct work_struct *work)
 			goto pps_dc_reschedule;
 		}
 
-		if (tdev)
-			gcpm_update_mdis_charge_cntl_limit(tdev, tdev->current_level);
+		/* force the callback set main -> dc thermal limits */
+		if (tdev && gcpm->mdis_votable)
+			gvotable_run_election(gcpm->mdis_votable, true);
 
 		/*
 		 * offine current adapter and start new. Charging is enabled
@@ -1915,8 +1953,10 @@ static int gcpm_psy_set_property(struct power_supply *psy,
 	case GBMS_PROP_TAPER_CONTROL: {
 		int count = 0;
 
-		if (pval->intval != GBMS_TAPER_CONTROL_OFF)
+		if (pval->intval != GBMS_TAPER_CONTROL_OFF) {
 			count = gcpm->taper_step_count + gcpm->taper_step_grace;
+			pr_info("%s: TaperControl value=%d\n", __func__, count);
+		}
 
 		/* ta_check is set when taper control changes value */
 		ta_check = gcpm_taper_ctl(gcpm, count);
@@ -2003,7 +2043,7 @@ static int gcpm_psy_set_property(struct power_supply *psy,
 
 	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
 		psp = POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE_MAX;
-		/* compat, fall through */
+		fallthrough;
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE_MAX:
 		ta_check = gcpm->fv_uv != pval->intval;
 		gcpm->fv_uv = pval->intval;
@@ -2095,8 +2135,24 @@ done:
 	 * Will disable CC_MAX vote on GCPM_FCC when/if the limit is routed
 	 * to the main-charger.
 	 */
-	if (psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX)
+	if (psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX) {
+		if (!route && gcpm->cop_enabled) {
+			struct power_supply *main_chg_psy = NULL;
+
+			/* Route to main charger if COP enabled */
+			main_chg_psy = gcpm_chg_get_default(gcpm);
+			if (main_chg_psy) {
+				ret = power_supply_set_property(main_chg_psy, psp, pval);
+				if (ret < 0 && ret != -EAGAIN) {
+					pr_err("cannot route prop=%d to default:%s (%d)\n", psp,
+						gcpm_psy_name(main_chg_psy), ret);
+				}
+			} else {
+				pr_err("invalid default charger for prop=%d\n", psp);
+			}
+		}
 		gcpm_update_gcpm_fcc(gcpm, "CC_MAX", gcpm->cc_max, !route);
+	}
 
 	mutex_unlock(&gcpm->chg_psy_lock);
 
@@ -2595,13 +2651,14 @@ static int gcpm_set_mdis_charge_cntl_limit(struct thermal_cooling_device *tcd,
 {
 	struct mdis_thermal_device *tdev = tcd->devdata;
 	struct gcpm_drv *gcpm = tdev->gcpm;
+	struct gvotable_election* el = gcpm->mdis_votable;
 	int ret;
 
 	if (tdev->thermal_levels <= 0 || lvl < 0 || lvl > tdev->thermal_levels)
 		return -EINVAL;
 
 	mutex_lock(&gcpm->chg_psy_lock);
-	ret = gcpm_update_mdis_charge_cntl_limit(tdev, lvl);
+	ret = gvotable_cast_int_vote(el, REASON_MDIS, lvl, lvl > 0);
 	mutex_unlock(&gcpm->chg_psy_lock);
 
 	return ret;
@@ -2727,15 +2784,6 @@ static int gcpm_update_mdis_charge_cntl_limit(struct mdis_thermal_device *tdev,
 	if (ret < 0)
 		pr_err("%s: cannot update limits (%d)", __func__, ret);
 
-	/*  fix the disable, run another charging loop */
-	if (gcpm->mdis_votable) {
-		ret = gvotable_cast_int_vote(gcpm->mdis_votable, "MDIS",
-					     lvl, lvl >= 0);
-		if (ret < 0)
-			pr_err("%s: cannot update MDIS level (%d)", __func__, ret);
-
-	}
-
 	return 0;
 }
 
@@ -2760,6 +2808,41 @@ state2power_table_show(struct device *dev, struct device_attribute *attr, char *
 }
 
 static DEVICE_ATTR_RO(state2power_table);
+
+static ssize_t
+mdis_vote_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct gcpm_drv *gcpm = dev_get_drvdata(dev);
+	struct gvotable_election* el = gcpm->mdis_votable;
+	int lvl;
+
+	lvl = gvotable_get_int_vote(el, MDIS_REASON_SETUP);
+
+	return sprintf(buf, "%d\n", lvl);
+}
+
+static ssize_t
+mdis_vote_store(struct device *dev, struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+	struct gcpm_drv *gcpm = dev_get_drvdata(dev);
+	struct gvotable_election* el = gcpm->mdis_votable;
+	int ret;
+	long lvl;
+
+	ret = kstrtol(buf, 0, &lvl);
+	if (ret)
+		return ret;
+	mutex_lock(&gcpm->chg_psy_lock);
+	ret = gvotable_cast_int_vote(el, MDIS_REASON_SETUP, lvl, lvl > 0);
+	mutex_unlock(&gcpm->chg_psy_lock);
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(mdis_vote);
 
 static ssize_t
 mdis_out_table_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -3120,11 +3203,15 @@ static int gcpm_mdis_callback(struct gvotable_election *el, const char *reason,
 {
 	struct gcpm_drv *gcpm = gvotable_get_data(el);
 	struct mdis_thermal_device *tdev = &gcpm->thermal_device;
-	const int budget = (long)value;
-	bool trigger_select = budget != 0 && gcpm->cp_fcc_hold;
+	const int lvl = (long)value;
+	bool trigger_select;
 
-	pr_debug("MSC_MDIS callback lvl=%d budget=%d hold=%d cp_fcc_hold_limit=%d\n",
-		 tdev->current_level, budget, gcpm->cp_fcc_hold,
+	gcpm_update_mdis_charge_cntl_limit(tdev, lvl);
+
+	trigger_select = lvl != 0 && gcpm->cp_fcc_hold;
+
+	pr_debug("MSC_MDIS callback cur_lvl=%d lvl=%d hold=%d cp_fcc_hold_limit=%d\n",
+		 tdev->current_level, lvl, gcpm->cp_fcc_hold,
 		 gcpm->cp_fcc_hold_limit);
 
 	/*
@@ -3209,9 +3296,16 @@ static int gcpm_fcc_callback(struct gvotable_election *el, const char *reason,
 
 	ret = GPSY_SET_PROP(cp_psy, POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
 			    limit);
+
 	if (ret < 0)
 		pr_err("MSC_GCPM_FCC: cannot apply cp_limit to cc_max=%d (%d)\n",
 		       limit, ret);
+
+	if (ret == -EAGAIN) {
+		gcpm->fcc_retries = GCPM_FCC_RETRIES;
+		gcpm->fcc_retry_limit = limit;
+		mod_delayed_work(system_wq, &gcpm->fcc_retry_work, GCPM_FCC_RETRY_INTERVAL);
+	}
 
 	pr_debug("MSC_GCPM_FCC: applied new cp_limit=%d cp_min=%d ret=%d\n",
 		 limit, cp_min, ret);
@@ -3281,7 +3375,7 @@ static int gcpm_init_mdis(struct gcpm_drv *gcpm)
 
 	/* mdis thermal engine uses this callback */
 	gcpm->mdis_votable =
-		gvotable_create_int_election(NULL, gvotable_comparator_int_min,
+		gvotable_create_int_election(NULL, gvotable_comparator_int_max,
 					     gcpm_mdis_callback, gcpm);
 	if (IS_ERR_OR_NULL(gcpm->mdis_votable)) {
 		ret = PTR_ERR(gcpm->mdis_votable);
@@ -3289,7 +3383,7 @@ static int gcpm_init_mdis(struct gcpm_drv *gcpm)
 		return ret;
 	}
 
-	gvotable_set_default(gcpm->mdis_votable, (void *)-1);
+	gvotable_set_default(gcpm->mdis_votable, (void *)0);
 	gvotable_set_vote2str(gcpm->mdis_votable, gvotable_v2s_int);
 	gvotable_election_set_name(gcpm->mdis_votable, VOTABLE_MDIS);
 
@@ -3441,21 +3535,21 @@ static void gcpm_init_work(struct work_struct *work)
 		gcpm->init_complete = true;
 	}
 
+	dc_not_done = (gcpm->tcpm_phandle && !gcpm->tcpm_psy) ||
+		      (gcpm->wlc_dc_name && !gcpm->wlc_dc_psy);
+
 	/* keep looking for late arrivals, TCPM and WLC if set */
-	if (found == gcpm->chg_psy_count)
+	if (found == gcpm->chg_psy_count && !dc_not_done)
 		gcpm->chg_psy_retries = 0;
 	else if (gcpm->chg_psy_retries)
 		gcpm->chg_psy_retries--;
-
-	dc_not_done = (gcpm->tcpm_phandle && !gcpm->tcpm_psy) ||
-		      (gcpm->wlc_dc_name && !gcpm->wlc_dc_psy);
 
 	pr_warn("%s retries=%d dc_not_done=%d tcpm_ok=%d wlc_ok=%d\n",
 		__func__, gcpm->chg_psy_retries, dc_not_done,
 		(!gcpm->tcpm_phandle || gcpm->tcpm_psy),
 		(!gcpm->wlc_dc_name || gcpm->wlc_dc_psy));
 
-	if (gcpm->chg_psy_retries || dc_not_done) {
+	if (gcpm->chg_psy_retries) {
 		const unsigned long jif = msecs_to_jiffies(INIT_RETRY_DELAY_MS);
 
 		schedule_delayed_work(&gcpm->init_work, jif);
@@ -3476,6 +3570,38 @@ static void gcpm_init_work(struct work_struct *work)
 
 	/* might run along set_property() */
 	mod_delayed_work(system_wq, &gcpm->select_work, 0);
+}
+
+static void gcpm_fcc_retry_work(struct work_struct *work)
+{
+	struct gcpm_drv *gcpm = container_of(work, struct gcpm_drv,
+					     fcc_retry_work.work);
+	int ret = 0;
+	struct power_supply *cp_psy;
+
+	mutex_lock(&gcpm->chg_psy_lock);
+
+	if (gcpm->fcc_retries--) {
+		cp_psy = gcpm_chg_get_active_cp(gcpm);
+		if (!cp_psy) {
+			pr_debug("MSC_GCPM_FCC_RETRY: not active limit=%d\n", gcpm->fcc_retry_limit);
+			goto exit;
+		}
+
+		ret = GPSY_SET_PROP(cp_psy, POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
+			gcpm->fcc_retry_limit);
+
+		if (ret < 0)
+			pr_err("MSC_GCPM_FCC_RETRY: cannot apply cp_limit to cc_max=%d (%d)\n",
+			gcpm->fcc_retry_limit, ret);
+
+		if (ret == -EAGAIN)
+			schedule_delayed_work(&gcpm->fcc_retry_work, GCPM_FCC_RETRY_INTERVAL);
+	}
+
+exit:
+	mutex_unlock(&gcpm->chg_psy_lock);
+
 }
 
 /* ------------------------------------------------------------------------ */
@@ -4015,6 +4141,7 @@ static int google_cpm_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&gcpm->pps_work, gcpm_pps_wlc_dc_work);
 	INIT_DELAYED_WORK(&gcpm->select_work, gcpm_chg_select_work);
 	INIT_DELAYED_WORK(&gcpm->init_work, gcpm_init_work);
+	INIT_DELAYED_WORK(&gcpm->fcc_retry_work, gcpm_fcc_retry_work);
 	mutex_init(&gcpm->chg_psy_lock);
 
 	gcpm->gcpm_ws = wakeup_source_register(NULL, "google-cpm");
@@ -4151,6 +4278,15 @@ static int google_cpm_probe(struct platform_device *pdev)
 				   &gcpm->taper_step_current);
 	if (ret < 0)
 		gcpm->taper_step_current = GCPM_TAPER_STEP_CURRENT;
+	ret = of_property_read_u32(pdev->dev.of_node, "google,wlc-dc-fcc-ua",
+				   &gcpm->wlc_dc_fcc);
+	if (ret < 0)
+		gcpm->wlc_dc_fcc = 0;
+
+	gcpm->no_init_wlc_ta_vol = of_property_read_bool(pdev->dev.of_node,
+							"google,no-init-wlc-ta-vol");
+
+	gcpm->cop_enabled = of_property_read_bool(pdev->dev.of_node, "google,cop-enabled");
 
 	dev_info(gcpm->device, "taper ts_m=%d ts_ccs=%d ts_i=%d ts_cnt=%d ts_g=%d ts_v=%d ts_c=%d\n",
 		 gcpm->taper_step_fv_margin, gcpm->taper_step_cc_step,
@@ -4267,6 +4403,10 @@ static int google_cpm_probe(struct platform_device *pdev)
 	ret = device_create_file(gcpm->device, &dev_attr_thermal_mdis_fan_alarm);
 	if (ret)
 		dev_err(gcpm->device, "Failed to create thermal_mdis_fan_alarm\n");
+
+	ret = device_create_file(gcpm->device, &dev_attr_mdis_vote);
+	if (ret)
+		dev_err(gcpm->device, "Failed to create mdis_vote\n");
 
 	/* give time to fg driver to start */
 	schedule_delayed_work(&gcpm->init_work,

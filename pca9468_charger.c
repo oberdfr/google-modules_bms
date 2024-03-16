@@ -91,13 +91,15 @@ static int adc_gain[16] = { 0,  1,  2,  3,  4,  5,  6,  7,
 /* IIN_CC adc offset for accuracy */
 #define PCA9468_IIN_ADC_OFFSET		20000	/* uA */
 /* IIN_CC compensation offset */
-#define PCA9468_IIN_CC_COMP_OFFSET	50000	/* uA */
+#define PCA9468_IIN_CC_COMP_OFFSET	25000	/* uA */
 /* IIN_CC compensation offset in Power Limit Mode(Constant Power) TA */
 #define PCA9468_IIN_CC_COMP_OFFSET_CP	20000	/* uA */
 /* TA maximum voltage that can support CC in Constant Power Mode */
 #define PCA9468_TA_MAX_VOL_CP		9800000	/* 9760000uV --> 9800000uV */
 /* Offset for cc_max / 2 */
 #define PCA9468_IIN_MAX_OFFSET		0
+/* Offset for TA max current */
+#define PCA9468_TA_CUR_MAX_OFFSET	200000 /* uA */
 
 
 /* maximum retry counter for restarting charging */
@@ -129,6 +131,7 @@ static int adc_gain[16] = { 0,  1,  2,  3,  4,  5,  6,  7,
 #define PCA9468_SC_CLK_DITHER_LIMIT_DEF	0xF	/* 10% */
 
 #define PCA9468_TIER_SWITCH_DELTA	25000	/* uV */
+#define PCA9468_TA_MAX_CUR_MULT_DEF	1	/* No WLC Cap Div */
 
 /* INT1 Register Buffer */
 enum {
@@ -369,6 +372,12 @@ static int pca9468_set_input_current(struct pca9468_charger *pca9468,
 		 iin, val * PCA9468_IIN_CFG_STEP, ret);
 
 	return ret;
+}
+
+static inline bool pca9468_can_inc_ta_cur(struct pca9468_charger *pca9468)
+{
+	return pca9468->ta_cur + PD_MSG_TA_CUR_STEP < min(pca9468->ta_max_cur,
+		pca9468->iin_cc + PCA9468_TA_CUR_MAX_OFFSET);
 }
 
 /* Returns the enable or disable value. into 1 or 0. */
@@ -1312,7 +1321,7 @@ static int pca9468_set_ta_current_comp(struct pca9468_charger *pca9468)
 			if (pca9468->ta_vol == pca9468->ta_max_vol) {
 				/* TA voltage is already the maximum voltage */
 				/* Compare TA max current */
-				if (pca9468->ta_cur == pca9468->ta_max_cur) {
+				if (!pca9468_can_inc_ta_cur(pca9468)) {
 					/* TA voltage and current are at max */
 					logbuffer_prlog(pca9468, LOGLEVEL_DEBUG,
 							"End1: ta_vol=%u, ta_cur=%u",
@@ -1360,7 +1369,7 @@ static int pca9468_set_ta_current_comp(struct pca9468_charger *pca9468)
 
 			/* Try to increase TA current */
 			/* Compare TA max current */
-			if (pca9468->ta_cur == pca9468->ta_max_cur) {
+			if (!pca9468_can_inc_ta_cur(pca9468)) {
 
 				/* TA current is already the maximum current */
 				/* Compare TA max voltage */
@@ -1413,7 +1422,7 @@ static int pca9468_set_ta_current_comp(struct pca9468_charger *pca9468)
 			/* TA voltage is already the maximum voltage */
 
 			/* Compare TA maximum current */
-			if (pca9468->ta_cur == pca9468->ta_max_cur) {
+			if (!pca9468_can_inc_ta_cur(pca9468)) {
 				/*
 				* TA voltage and current are already at the
 				 * maximum values
@@ -2359,6 +2368,9 @@ static int pca9468_set_new_cc_max(struct pca9468_charger *pca9468, int cc_max)
 		goto done;
 	}
 
+	if (pca9468->ta_max_cur && pca9468->ta_max_cur < iin_max)
+		iin_max = pca9468->ta_max_cur;
+
 	ret = pca9468_set_new_iin(pca9468, iin_max);
 	if (ret == 0)
 		pca9468->cc_max = cc_max;
@@ -2613,7 +2625,7 @@ static int pca9468_ajdust_ccmode_wired(struct pca9468_charger *pca9468, int iin)
 
 		/* Try to increase TA current */
 		/* Check APDO max current */
-	} else if (pca9468->ta_cur == pca9468->ta_max_cur) {
+	} else if (!pca9468_can_inc_ta_cur(pca9468)) {
 		/* TA current is maximum current */
 
 		logbuffer_prlog(pca9468, LOGLEVEL_DEBUG,
@@ -4256,6 +4268,8 @@ static int pca9468_const_charge_voltage(struct pca9468_charger *pca9468)
 	return (val * 5 + 3725) * 1000;
 }
 
+#define get_boot_sec() div_u64(ktime_to_ns(ktime_get_boottime()), NSEC_PER_SEC)
+
 /* index is the PPS source to use */
 static int pca9468_set_charging_enabled(struct pca9468_charger *pca9468, int index)
 {
@@ -4575,7 +4589,7 @@ static bool pca9468_is_reg(struct device *dev, unsigned int reg)
 }
 
 static struct regmap_config pca9468_regmap = {
-	.name		= "pca9468-mains",
+	.name		= "dc-mains",
 	.reg_bits	= 8,
 	.val_bits	= 8,
 	.max_register	= PCA9468_MAX_REGISTER,
@@ -4723,6 +4737,12 @@ static int of_pca9468_dt(struct device *dev,
 			pdata->sc_clk_dither_limit);
 	pdata->sc_clk_dither_en = of_property_read_bool(np_pca9468, "pca9468,spread-spectrum");
 	pr_info("%s: pca9468,spread-spectrum is %u\n", __func__, pdata->sc_clk_dither_en);
+
+	ret = of_property_read_u32(np_pca9468, "pca9468,ta-max-cur-mult", &pdata->ta_max_cur_mult);
+	if (ret)
+		pdata->ta_max_cur_mult = PCA9468_TA_MAX_CUR_MULT_DEF;
+	else
+		pr_info("%s: pca9468,ta-max-cur-mult is %d\n", __func__, pdata->ta_max_cur_mult);
 
 #ifdef CONFIG_THERMAL
 	/* USBC thermal zone */
